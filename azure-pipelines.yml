@@ -1,43 +1,71 @@
-trigger: none
-pr: none
-schedules:
-- cron: '0 */3 * * *'
-  displayName: Run update every 3 hours  
+# Azure DevOps Pipeline for OWASP Dependency Check Update
+# This pipeline updates the OWASP dependency check database with the latest vulnerability data
+
+trigger:
   branches:
     include:
+    - main
     - master
-  always: 'true'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: 'owasp-dependency-check-secrets'  # Variable group containing sensitive data
+  - name: GRADLE_USER_HOME
+    value: $(Pipeline.Workspace)/.gradle
+  - name: NVD_API_DELAY
+    value: '4000'
+
 jobs:
+- job: UpdateDependencyCheck
+  displayName: 'Update OWASP Dependency Check Database'
+  timeoutInMinutes: 60
+  
+  steps:
+  - checkout: self
+    displayName: 'Checkout source code'
 
-  - job: owasp_update_flexible
-    displayName: Update OWASP dependency check DB on Postgres Flexible Server - Production
-    pool:
-      name: 'hmcts-cftptl-agent-pool'
-    variables:
-      serviceConnection: azurerm-prod
-      keyvaultName: cftptl-intsvc
-    timeoutInMinutes: 600
-    steps:
-      - task: AzureKeyVault@2
-        displayName: 'Get secrets from Keyvault'
-        inputs:
-          azureSubscription: ${{ variables.serviceConnection }}
-          keyVaultName: ${{ variables.keyvaultName }}
-          secretsFilter: 'OWASPPostgresDb-v15-Password,OWASPPostgresDb-v15-Account,nvd-api-key'
-          RunAsPreJob: true
+  - task: JavaToolInstaller@0
+    displayName: 'Install Java 11'
+    inputs:
+      versionSpec: '11'
+      jdkArchitectureOption: 'x64'
+      jdkSourceOption: 'PreInstalled'
 
-      - task: Gradle@2
-        displayName: 'Running OWASP V15 DB migrations'
-        inputs:
-          gradleWrapperFile: 'gradlew'
-          options: "--build-file build-v10.gradle -DfailBuild='true' -Dflyway.url=jdbc:postgresql://owaspdependency-prod.postgres.database.azure.com/owaspdependencycheck -Dflyway.user=$(OWASPPostgresDb-v15-Account) -Dflyway.password=$(OWASPPostgresDb-v15-Password) -Dflyway.locations=filesystem:db-migrations/v10"
-          tasks: 'flywayMigrate'
-          gradleOptions: -Xmx2g -XX:+HeapDumpOnOutOfMemoryError
+  - task: Cache@2
+    displayName: 'Cache Gradle dependencies'
+    inputs:
+      key: 'gradle | "$(Agent.OS)" | **/gradle-wrapper.properties'
+      restoreKeys: |
+        gradle | "$(Agent.OS)"
+        gradle
+      path: $(GRADLE_USER_HOME)
 
-      - task: Gradle@2
-        displayName: 'Updating OWASP V15 DB'
-        inputs:
-          gradleWrapperFile: 'gradlew'
-          options: "--build-file build-v10.gradle -DfailOnError='true' -Ddata.driver_name=org.postgresql.Driver -Ddata.connection_string=jdbc:postgresql://owaspdependency-prod.postgres.database.azure.com/owaspdependencycheck -Ddata.user=$(OWASPPostgresDb-v15-Account) -Dnvd.api.key=$(nvd-api-key) -Ddata.password=$(OWASPPostgresDb-v15-Password) -Ddatabase.batchinsert.enabled='true'"
-          tasks: 'dependencyCheckUpdate'
-          gradleOptions: -Xmx3g -XX:+HeapDumpOnOutOfMemoryError
+  - task: Bash@3
+    displayName: 'Make update script executable'
+    inputs:
+      targetType: 'inline'
+      script: 'chmod +x update-dependencies.sh'
+
+  - task: Bash@3
+    displayName: 'Update OWASP Dependency Check Database'
+    inputs:
+      targetType: 'filePath'
+      filePath: './update-dependencies.sh'
+    env:
+      DB_PASSWORD: $(DB_PASSWORD)
+      NVD_API_KEY: $(NVD_API_KEY)
+      DB_HOST: $(DB_HOST)
+      DB_NAME: $(DB_NAME)
+      DB_USER: $(DB_USER)
+      NVD_API_DELAY: $(NVD_API_DELAY)
+    continueOnError: false
+
+  - task: PublishTestResults@2
+    displayName: 'Publish test results'
+    condition: always()
+    inputs:
+      testResultsFiles: '**/TEST-*.xml'
+      testRunTitle: 'OWASP Dependency Check Update'
+      failTaskOnFailedTests: false
